@@ -55,7 +55,44 @@ void host_graph_iterate(unsigned int *graph_indices, unsigned int *graph_edges, 
 }
 
 
-// TODO your kernel code here
+__global__ void device_graph_propagate(unsigned int *graph_indices, unsigned int *graph_edges, float *graph_nodes_in, float *graph_nodes_out, float * inv_edges_per_node, int nr_iterations, int array_length)
+{
+  const unsigned int block_id = blockIdx.x;
+  const unsigned int thread_id = threadIdx.x;
+  // what if we use a different number of threads per block? 480
+  // NOTICE: BLOCKSIZE MUST BE MULTIPLE OF 32 (WARP)
+  // share memory: 
+  // graph_indices: we need to store (480 + 1) * unsigned int = 481 * 4 B
+  // graph_indices[i+1] = graph_indices[i] + (i % 15) + 1, where i = 480 * blockID + threadID, i%15 = threadID%15
+  // graph_edges: the total length is: 3840 * unsigned int = 3840 * 4 B
+
+  // TODO: balance the workload
+
+
+  #pragma unroll
+  // TODO: pipeline
+  for(int iter = 0; iter < nr_iterations; iter+=2) {
+    for(int i=0; i < array_length; i++)
+    {
+      float sum = 0.f; 
+      for(int j = graph_indices[i]; j < graph_indices[i+1]; j++)
+      {
+        sum += graph_nodes_in[graph_edges[j]]*inv_edges_per_node[graph_edges[j]];
+      }
+      graph_nodes_out[i] = 0.5f/(float)array_length + 0.5f*sum;
+    }
+
+    for(int i=0; i < array_length; i++)
+    {
+      float sum = 0.f; 
+      for(int j = graph_indices[i]; j < graph_indices[i+1]; j++)
+      {
+        sum += graph_nodes_out[graph_edges[j]]*inv_edges_per_node[graph_edges[j]];
+      }
+      graph_nodes_in[i] = 0.5f/(float)array_length + 0.5f*sum;
+    }
+  }
+}
 
 
 
@@ -68,7 +105,7 @@ void device_graph_iterate(unsigned int *h_graph_indices,
                           int num_elements,
                           int avg_edges)
 {
-  // TODO all of your gpu memory allocation and copying to gpu memory has to be in this function
+  assert((nr_iterations % 2) == 0);
 
   start_timer(&timer);
 

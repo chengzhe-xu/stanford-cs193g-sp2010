@@ -44,7 +44,37 @@ void host_shift_cypher(unsigned int *input_array, unsigned int *output_array, un
 // This kernel implements a per element shift
 __global__ void shift_cypher(unsigned int *input_array, unsigned int *output_array, unsigned int shift_amount, unsigned int alphabet_max, unsigned int array_length)
 {
-  // TODO your code here
+  // naive one:
+  // // block id and thread id. using 1D block and threads
+  // const unsigned int block_id = blockIdx.x;
+  // const unsigned int thread_id = threadIdx.x;
+  // // __shared__ __align__(16 * 1024) char share_mem[512 * sizeof(unsigned int)]; // not using dynamic shared memory allocation
+  // output_array[512 * block_id + thread_id] = (input_array[512 * block_id + thread_id] + shift_amount) % (alphabet_max + 1);
+  // // __syncthreads();
+  // return;
+
+  // block id and thread id. using 1D block and threads
+  const unsigned int block_id = blockIdx.x;
+  const unsigned int thread_id = threadIdx.x;
+
+  // need share memory for 512 * sizeof(unsigned int) for input, will oprate in-place
+  // __shared__ __align__(16 * 1024) char share_mem[512 * sizeof(unsigned int)]; // not using dynamic shared memory allocation
+  __shared__ __align__(4 * 1024) char share_mem[512 * 4 + 32 * 4];
+  // smallest memory block is 32 byte, which is 32 * 8 bits
+  // char is 1 byte, we need 512 * 4 bytes, so the size of share_mem is 512 * 4
+  // notice that the 512 * 4 / 32 = 64, aligned, for bank conflict, add an extra 32 * 4
+  // in total: 2.215 * 1024, align with 4 * 1024
+  unsigned int * In_share = reinterpret_cast<unsigned int *>(share_mem);
+  // step 1, move all data into the share memory
+  In_share[thread_id] = __ldg(input_array + 512 * block_id + thread_id);
+  // __syncthreads();
+  // step 2, math
+  In_share[thread_id] = (In_share[thread_id] + shift_amount) % (alphabet_max + 1);
+  // __syncthreads();
+  // step 3, write back
+  output_array[512 * block_id + thread_id] = In_share[thread_id];
+  // __syncthreads();
+  return;
 }
 
 

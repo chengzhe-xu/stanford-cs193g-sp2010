@@ -59,24 +59,87 @@ void host_force_eval(float4 *set_A, float4 *set_B, int * indices, float4 *force_
 
 __global__ void force_eval(float4 *set_A, float4 *set_B, int * indices, float4 *force_vectors, int array_length)
 {
-  // TODO your code here ...
+  const unsigned int block_id = blockIdx.x;
+  const unsigned int thread_id = threadIdx.x;
+
+  // sizeof(float4) = 16 bytes, 4 * fp32
+  // share memory: we need to store set A, indices, and force results
+  // compute force in-place, and due to the memory pattern for set B, we wioll not copy set B into share memory
+  // for set A: 512 * 16 = 256 * 32
+  // for force results: 512 * 16 = 256 * 32 --- del
+  // for indices: 512 * 4 = 64 * 32
+  // in total: 576 * 32 --(24)-> 600 *32 = 18.5 * 1024 --- del
+  // in total: 320 * 32 --(16)-> 336 *32 = 10.5 * 1024
+  __shared__ __align__(16 * 1024) char share_mem[336 *32];
+  float4 * A_share = reinterpret_cast<float4 *>(share_mem);
+  // float4 * force_share = reinterpret_cast<float4 *>(share_mem + (256+8) * 32); // del
+  int * indices_share = reinterpret_cast<int *>(share_mem + (256+8) * 32);
+
+  float4 zero_float4 = make_float4(0.0,0.0,0.0,0.0);
+  float4 B_reg = zero_float4;
+
+  A_share[thread_id] = __ldg(set_A + 512 * block_id + thread_id);
+  indices_share[thread_id] = __ldg(indices + 512 * block_id + thread_id);
+  // __syncthreads();
+  if (indices_share[thread_id] < array_length && indices_share[thread_id] >= 0) {
+    B_reg = __ldg(set_B + indices_share[thread_id]); // TODO: better memory access pattern for B
+  
+    // __syncthreads();
+    float x = B_reg.x - A_share[thread_id].x;
+    float y = B_reg.y - A_share[thread_id].y;
+    float z = B_reg.z - A_share[thread_id].z;
+    float rsq = x*x + y*y + z*z + EPSILON;
+    float r = sqrt(rsq);
+    float f = A_share[thread_id].w * B_reg.w / rsq;
+    float inv_r = 1.0f / r;
+
+    force_vectors[512 * block_id + thread_id] = make_float4(x*inv_r,y*inv_r,z*inv_r,f);
+  } else {
+    force_vectors[512 * block_id + thread_id] = zero_float4;
+  }
+  // __syncthreads();
+  // force_vectors[512 * block_id + thread_id] = force_share[thread_id];
+  return;
 }
 
 
 
 void host_charged_particles(float4 *h_set_A, float4 *h_set_B, int *h_indices, float4 *h_force_vectors, int num_elements)
 { 
-  // TODO your code here ...
+  float4 *device_set_A = 0;
+  float4 *device_set_B = 0;
+  int *device_indices = 0;
+  float4 *device_force_vectors = 0;
+  // compute the size of the arrays in bytes
+  int num_bytes = num_elements * sizeof(float4);
+  // cudaMalloc device arrays
+  cudaMalloc((void**)&device_set_A, num_bytes);
+  cudaMalloc((void**)&device_set_B, num_bytes);
+  cudaMalloc((void**)&device_indices, num_elements * sizeof(int));
+  cudaMalloc((void**)&device_force_vectors, num_bytes);
+
+  // if either memory allocation failed, report an error message
+  if(device_set_A == 0 || device_set_B == 0 || device_indices == 0 || device_force_vectors == 0) {
+    printf("couldn't allocate memory\n");
+    return;
+  }
+
+  cudaMemcpy(device_set_A, h_set_A, num_bytes, cudaMemcpyHostToDevice);
+  cudaMemcpy(device_set_B, h_set_B, num_bytes, cudaMemcpyHostToDevice);
+  cudaMemcpy(device_indices, h_indices, num_elements * sizeof(int), cudaMemcpyHostToDevice);
+  cudaMemset(device_force_vectors, 0, num_bytes);
+
+  int block_size = 512;
+  int grid_size = (num_elements + block_size - 1) / block_size;
   
   start_timer(&timer);
   // launch kernel
-  
-  // the actual kernel launch should go here, so that the time it took is measured 
-
+  force_eval<<<grid_size, block_size>>>(device_set_A, device_set_B, device_indices, device_force_vectors, num_elements);
   check_launch("gpu force eval");
   stop_timer(&timer,"gpu force eval");
   
-  // TODO more code here...
+  cudaMemcpy(h_force_vectors, device_force_vectors, num_bytes, cudaMemcpyDeviceToHost);
+  return;
 }
 
 
