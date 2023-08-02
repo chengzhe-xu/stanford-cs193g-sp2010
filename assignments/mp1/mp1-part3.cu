@@ -54,43 +54,67 @@ void host_graph_iterate(unsigned int *graph_indices, unsigned int *graph_edges, 
   }
 }
 
+__device__ unsigned int device_compute_start_indices() {
+  const unsigned int block_id = blockIdx.x;
+  const unsigned int thread_id = threadIdx.x;
+  unsigned int start_indices = 3840 * block_id + thread_id + 105 * (thread_id/15) + ((thread_id-1)%15)*((thread_id-1)%15)/2;
+  return start_indices;
+}
+
 
 __global__ void device_graph_propagate(unsigned int *graph_indices, unsigned int *graph_edges, float *graph_nodes_in, float *graph_nodes_out, float * inv_edges_per_node, int nr_iterations, int array_length)
 {
   const unsigned int block_id = blockIdx.x;
   const unsigned int thread_id = threadIdx.x;
+  // TODO: pipeline
   // what if we use a different number of threads per block? 480
   // NOTICE: BLOCKSIZE MUST BE MULTIPLE OF 32 (WARP)
   // share memory: 
-  // graph_indices: we need to store (480 + 1) * unsigned int = 481 * 4 B
+  // graph_indices: we need to store (480 + 1) * unsigned int = 481 * 4 B ---> 488 * 4B --- del, we compute it on the fly
   // graph_indices[i+1] = graph_indices[i] + (i % 15) + 1, where i = 480 * blockID + threadID, i%15 = threadID%15
   // graph_edges: the total length is: 3840 * unsigned int = 3840 * 4 B
-
+  // share memory in total: 488 * 4 B + 3840 * 4 B = 4328*4B = 541*32B --(16*32)->557*32B = 17.5*1024
+  // Notice that we can compute the indices on the fly
+  // 
+  __shared__ __align__(32 * 1024) char share_mem[557*32];
+  
+  unsigned int * shared_graph_edges = reinterpret_cast<unsigned int *>(share_mem + (61+8) * 32);
   // TODO: balance the workload
+  // in 1 warp, the total dalay depends on the longest one, and other will be idle
 
-
+  // step 1 fetch global to shared memory
+  
+  // for this block, the graph_edges's index start from 
+  // [3840 Block_id, 3840 (Block_id+1) ), 8 items per thread
+  shared_graph_edges[thread_id + 480*0] = __ldg(graph_edges + 3840 * block_id + thread_id + 480*0);
+  shared_graph_edges[thread_id + 480*1] = __ldg(graph_edges + 3840 * block_id + thread_id + 480*1);
+  shared_graph_edges[thread_id + 480*2] = __ldg(graph_edges + 3840 * block_id + thread_id + 480*2);
+  shared_graph_edges[thread_id + 480*3] = __ldg(graph_edges + 3840 * block_id + thread_id + 480*3);
+  shared_graph_edges[thread_id + 480*4] = __ldg(graph_edges + 3840 * block_id + thread_id + 480*4);
+  shared_graph_edges[thread_id + 480*5] = __ldg(graph_edges + 3840 * block_id + thread_id + 480*5);
+  shared_graph_edges[thread_id + 480*6] = __ldg(graph_edges + 3840 * block_id + thread_id + 480*6);
+  shared_graph_edges[thread_id + 480*7] = __ldg(graph_edges + 3840 * block_id + thread_id + 480*7);
+  __syncthreads();
   #pragma unroll
-  // TODO: pipeline
   for(int iter = 0; iter < nr_iterations; iter+=2) {
-    for(int i=0; i < array_length; i++)
-    {
-      float sum = 0.f; 
-      for(int j = graph_indices[i]; j < graph_indices[i+1]; j++)
-      {
-        sum += graph_nodes_in[graph_edges[j]]*inv_edges_per_node[graph_edges[j]];
-      }
-      graph_nodes_out[i] = 0.5f/(float)array_length + 0.5f*sum;
+    float sum = 0.f;
+    unsigned int start_indices = device_compute_start_indices();
+    unsigned int end_indices = start_indices + 1 + thread_id%15;
+    for(int j = start_indices; j < end_indices; ++j) {
+      float tmp_input_node = __ldg(graph_nodes_in + shared_graph_edges[j - 3840 * block_id]);
+      float tmp_inv_edge = __ldg(inv_edges_per_node + shared_graph_edges[j - 3840 * block_id]);
+      sum += tmp_input_node * tmp_inv_edge;
     }
-
-    for(int i=0; i < array_length; i++)
-    {
-      float sum = 0.f; 
-      for(int j = graph_indices[i]; j < graph_indices[i+1]; j++)
-      {
-        sum += graph_nodes_out[graph_edges[j]]*inv_edges_per_node[graph_edges[j]];
-      }
-      graph_nodes_in[i] = 0.5f/(float)array_length + 0.5f*sum;
+    graph_nodes_out[480 * block_id + thread_id] = 0.5f/(float)array_length + 0.5f*sum;
+    __syncthreads();
+    sum = 0.f;
+    for(int j = start_indices; j < end_indices; ++j) {
+      float tmp_input_node = __ldg(graph_nodes_out + shared_graph_edges[j - 3840 * block_id]);
+      float tmp_inv_edge = __ldg(inv_edges_per_node + shared_graph_edges[j - 3840 * block_id]);
+      sum += tmp_input_node * tmp_inv_edge;
     }
+    graph_nodes_in[480 * block_id + thread_id] = 0.5f/(float)array_length + 0.5f*sum;
+    __syncthreads();
   }
 }
 
@@ -106,15 +130,40 @@ void device_graph_iterate(unsigned int *h_graph_indices,
                           int avg_edges)
 {
   assert((nr_iterations % 2) == 0);
+  unsigned int *device_graph_indices = 0;
+  unsigned int *device_graph_edges = 0;
+  float *device_graph_nodes_input = 0;
+  float *device_graph_nodes_result = 0;
+  float *device_inv_edges_per_node = 0;
+  // cudaMalloc device arrays
+  // cudaMalloc((void**)&device_graph_indices, (num_elements+1) * sizeof(unsigned int));
+  cudaMalloc((void**)&device_graph_edges, num_elements * avg_edges * sizeof(unsigned int));
+  cudaMalloc((void**)&device_graph_nodes_input, num_elements * sizeof(float));
+  cudaMalloc((void**)&device_graph_nodes_result, num_elements * sizeof(float));
+  cudaMalloc((void**)&device_inv_edges_per_node, num_elements * sizeof(float));
+
+  // if either memory allocation failed, report an error message
+  if(device_graph_edges == 0 || device_graph_nodes_input == 0 || device_graph_nodes_result == 0 || device_graph_nodes_result == 0 || device_inv_edges_per_node == 0) {
+    printf("couldn't allocate memory\n");
+    return;
+  }
+
+  cudaMemcpy(device_graph_edges, h_graph_edges, num_elements * avg_edges * sizeof(unsigned int), cudaMemcpyHostToDevice);
+  cudaMemcpy(device_graph_nodes_input, h_graph_nodes_input, num_elements * sizeof(float), cudaMemcpyHostToDevice);
+  cudaMemcpy(device_graph_nodes_result, h_graph_nodes_result, num_elements * sizeof(float), cudaMemcpyHostToDevice);
+  cudaMemcpy(device_inv_edges_per_node, h_inv_edges_per_node, num_elements * sizeof(float), cudaMemcpyHostToDevice);
+
+  int block_size = 480;
+  int grid_size = (num_elements + block_size - 1) / block_size;
 
   start_timer(&timer);
 
-  // TODO your device code should go here, so you can measure how long it takes
-  
+  device_graph_propagate(device_graph_indices, device_graph_edges, device_graph_nodes_input, device_graph_nodes_result, device_inv_edges_per_node, nr_iterations, num_elements);
   check_launch("gpu graph propagate");
   stop_timer(&timer,"gpu graph propagate");
 
-  // TODO your final result should end up in h_graph_nodes_result, which is a *host* pointer
+  cudaMemcpy(h_graph_nodes_result, device_graph_nodes_result, num_elements * sizeof(float), cudaMemcpyDeviceToHost);
+  return;
 }
 
 
